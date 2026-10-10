@@ -33,7 +33,9 @@ def iris_data() -> dict:
     group_name="training",
 )
 def train_and_register_iris_model(iris_data: dict) -> MaterializeResult:
-    tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow.mlflow.svc.cluster.local:5000")
+    tracking_uri = os.getenv(
+        "MLFLOW_TRACKING_URI", "http://mlflow.mlflow.svc.cluster.local:5000"
+    )
     mlflow.set_tracking_uri(tracking_uri)
     experiment_name = os.getenv("MLFLOW_EXPERIMENT_NAME", "iris-classification")
     mlflow.set_experiment(experiment_name)
@@ -58,16 +60,20 @@ def train_and_register_iris_model(iris_data: dict) -> MaterializeResult:
     f1 = float(f1_score(y_test, preds_test, average="weighted"))
 
     with mlflow.start_run(run_name="dagster-iris-train") as run:
-        mlflow.log_params({
-            "model_type": "LogisticRegression",
-            "max_iter": max_iter,
-            "C": c_val,
-        })
-        mlflow.log_metrics({
-            "train_accuracy": train_acc,
-            "test_accuracy": test_acc,
-            "f1_score": f1,
-        })
+        mlflow.log_params(
+            {
+                "model_type": "LogisticRegression",
+                "max_iter": max_iter,
+                "C": c_val,
+            }
+        )
+        mlflow.log_metrics(
+            {
+                "train_accuracy": train_acc,
+                "test_accuracy": test_acc,
+                "f1_score": f1,
+            }
+        )
 
         mlflow.sklearn.log_model(
             sk_model=model,
@@ -81,7 +87,11 @@ def train_and_register_iris_model(iris_data: dict) -> MaterializeResult:
     client = MlflowClient(tracking_uri=tracking_uri)
     # Find latest version for this model
     registered_model = client.get_registered_model(model_name)
-    latest_version = registered_model.latest_versions[-1].version if registered_model.latest_versions else "1"
+    latest_version = (
+        registered_model.latest_versions[-1].version
+        if registered_model.latest_versions
+        else "1"
+    )
 
     # In MLflow 3+, aliases (e.g. @Production) supersede legacy stages
     client.set_registered_model_alias(
