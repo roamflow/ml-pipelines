@@ -1,0 +1,100 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run pytest -q
+
+  build:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.versioning.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract version and short SHA
+        id: versioning
+        run: |
+          VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "tag=v${VERSION}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ steps.versioning.outputs.tag }}
+            type=raw,value=latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  promote:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout GitOps repo (roamflow/devops)
+        uses: actions/checkout@v4
+        with:
+          repository: roamflow/devops
+          ssh-key: ${{ secrets.DEVOPS_DEPLOY_KEY }}
+          ref: main
+
+      - name: Promote image tag to GitOps repo
+        run: |
+          NEW_TAG="${{ needs.build.outputs.tag }}"
+          VALUES_FILE="apps/ml-pipelines/values.yaml"
+          echo "Promoting ml-pipelines image tag to: ${NEW_TAG}"
+
+          if [ -f "$VALUES_FILE" ]; then
+            sed -i -E "s|tag: \".*\"|tag: \"${NEW_TAG}\"|" "$VALUES_FILE"
+
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+
+            if git diff --quiet; then
+              echo "No change in image tag."
+            else
+              git add "$VALUES_FILE"
+              git commit -m "chore(ml-pipelines): bump image tag to ${NEW_TAG} [skip ci]"
+              git push origin main
+            fi
+          else
+            echo "Warning: $VALUES_FILE not found yet. Skipping automatic promotion."
+          fi
