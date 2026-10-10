@@ -3,6 +3,7 @@ import os
 import mlflow
 from dagster import MaterializeResult, MetadataValue, asset
 from mlflow import MlflowClient
+from scipy.stats import ks_2samp
 from sklearn.datasets import load_iris
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
@@ -28,7 +29,7 @@ def iris_data() -> dict:
 
 
 @asset(
-    description="Trains LogisticRegression on Iris, logs runs and registers model in MLflow Registry with 'Production' alias.",
+    description="Trains LogisticRegression on Iris, evaluates against Quality Gate (min accuracy), and promotes to 'Production' alias only if gate passes.",
     compute_kind="sklearn",
     group_name="training",
 )
@@ -43,6 +44,7 @@ def train_and_register_iris_model(iris_data: dict) -> MaterializeResult:
     model_name = os.getenv("MODEL_NAME", "iris-classifier")
     max_iter = int(os.getenv("MAX_ITER", "200"))
     c_val = float(os.getenv("C_VALUE", "1.0"))
+    min_acc_threshold = float(os.getenv("MIN_ACCURACY_THRESHOLD", "0.90"))
 
     X_train = iris_data["X_train"]
     X_test = iris_data["X_test"]
@@ -65,6 +67,7 @@ def train_and_register_iris_model(iris_data: dict) -> MaterializeResult:
                 "model_type": "LogisticRegression",
                 "max_iter": max_iter,
                 "C": c_val,
+                "min_acc_threshold": min_acc_threshold,
             }
         )
         mlflow.log_metrics(
@@ -83,9 +86,9 @@ def train_and_register_iris_model(iris_data: dict) -> MaterializeResult:
 
         run_id = run.info.run_id
 
-    # Promote registered model to 'Production' alias in MLflow 3.17 Registry
+    # Model Evaluation Gate
+    passed_gate = test_acc >= min_acc_threshold
     client = MlflowClient(tracking_uri=tracking_uri)
-    # Find latest version for this model
     registered_model = client.get_registered_model(model_name)
     latest_version = (
         registered_model.latest_versions[-1].version
@@ -93,22 +96,80 @@ def train_and_register_iris_model(iris_data: dict) -> MaterializeResult:
         else "1"
     )
 
-    # In MLflow 3+, aliases (e.g. @Production) supersede legacy stages
-    client.set_registered_model_alias(
-        name=model_name,
-        alias="Production",
-        version=latest_version,
-    )
+    if passed_gate:
+        # Promote winning model to 'Production' alias in MLflow 3.17 Registry
+        client.set_registered_model_alias(
+            name=model_name,
+            alias="Production",
+            version=latest_version,
+        )
+        model_alias = "Production"
+    else:
+        # Keep existing production model intact; mark this candidate as rejected
+        client.set_registered_model_alias(
+            name=model_name,
+            alias="Candidate_Rejected",
+            version=latest_version,
+        )
+        model_alias = "Candidate_Rejected"
 
     return MaterializeResult(
         metadata={
             "model_name": MetadataValue.text(model_name),
             "model_version": MetadataValue.text(str(latest_version)),
-            "model_alias": MetadataValue.text("Production"),
+            "model_alias": MetadataValue.text(model_alias),
+            "evaluation_gate_passed": MetadataValue.bool(passed_gate),
+            "min_accuracy_threshold": MetadataValue.float(min_acc_threshold),
             "test_accuracy": MetadataValue.float(test_acc),
             "train_accuracy": MetadataValue.float(train_acc),
             "f1_score": MetadataValue.float(f1),
             "mlflow_run_id": MetadataValue.text(run_id),
-            "mlflow_model_uri": MetadataValue.text(f"models:/{model_name}@Production"),
+            "mlflow_model_uri": MetadataValue.text(
+                f"models:/{model_name}@{model_alias}"
+            ),
+        }
+    )
+
+
+@asset(
+    description="Compares baseline training features against test/serving features using Kolmogorov-Smirnov test to detect data distribution drift.",
+    compute_kind="scipy",
+    group_name="monitoring",
+)
+def detect_data_drift(iris_data: dict) -> MaterializeResult:
+    X_train = iris_data["X_train"]
+    X_test = iris_data["X_test"]
+
+    p_value_threshold = float(os.getenv("DRIFT_P_VALUE_THRESHOLD", "0.05"))
+    drift_results = {}
+    drifted_features = []
+
+    for col in X_train.columns:
+        stat, p_val = ks_2samp(X_train[col], X_test[col])
+        is_drifted = bool(p_val < p_value_threshold)
+        drift_results[col] = {
+            "statistic": round(float(stat), 4),
+            "p_value": round(float(p_val), 4),
+            "drift_detected": is_drifted,
+        }
+        if is_drifted:
+            drifted_features.append(col)
+
+    has_drift = len(drifted_features) > 0
+
+    return MaterializeResult(
+        metadata={
+            "drift_detected": MetadataValue.bool(has_drift),
+            "p_value_threshold": MetadataValue.float(p_value_threshold),
+            "drifted_features_count": MetadataValue.int(len(drifted_features)),
+            "drifted_features": MetadataValue.text(
+                ", ".join(drifted_features) if drifted_features else "None"
+            ),
+            "feature_metrics": MetadataValue.json(drift_results),
+            "status": MetadataValue.text(
+                "ALERT: Data drift detected across features!"
+                if has_drift
+                else "OK: Data distributions match training baseline."
+            ),
         }
     )
